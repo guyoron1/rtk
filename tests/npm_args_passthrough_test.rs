@@ -47,13 +47,13 @@ fn npm_args_are_forwarded_verbatim() {
 
     // One case per shape the old allowlist got wrong, plus the two it got right.
     let cases: &[&[&str]] = &[
-        &["query", ".name"],      // npm 8 subcommand, was missing from the list
+        &["query", ".name"], // npm 8 subcommand, was missing from the list
         &["sbom", "--sbom-format=cyclonedx"], // npm 10 subcommand, ditto
-        &["add", "lodash"],       // alias of install
-        &["x", "cowsay"],         // alias of exec
-        &["build"],               // a package.json script: must NOT become `npm run build`
-        &["run", "build"],        // explicit run: must not gain a second `run`
-        &["--version"],           // a bare flag
+        &["add", "lodash"],  // alias of install
+        &["x", "cowsay"],    // alias of exec
+        &["build"],          // a package.json script: must NOT become `npm run build`
+        &["run", "build"],   // explicit run: must not gain a second `run`
+        &["--version"],      // a bare flag
     ];
 
     for case in cases {

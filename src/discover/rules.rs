@@ -99,7 +99,14 @@ pub const RULES: &[RtkRule] = &[
         subcmd_status: &[("fmt", RtkStatus::Passthrough)],
     },
     RtkRule {
-        pattern: r"^pnpm\s+(exec|i|install|list|ls|outdated|run|run-script)",
+        // Any bare `pnpm <word>` routes here, so a package.json script keeps its
+        // real flags, chain and exit code instead of being re-spelled as a tool
+        // invocation. Enumerating script names would just be another list to
+        // chase. The first token must not start with `-`: a global flag is not a
+        // subcommand, and `rtk pnpm --filter @app` / `rtk pnpm -x install` would
+        // die at clap. Flag-first forms keep reaching this rule through
+        // `strip_pnpm_global_opts` (#3275), which only strips the fixed set.
+        pattern: r"^pnpm\s+[^-\s]\S*",
         rtk_cmd: "rtk pnpm",
         rewrite_prefixes: &["pnpm"],
         category: "PackageManager",
