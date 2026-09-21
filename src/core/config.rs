@@ -227,6 +227,14 @@ pub struct LimitsConfig {
     pub status_max_untracked: usize,
     /// Max chars for parser passthrough fallback (default: 2000)
     pub passthrough_max_chars: usize,
+    /// Emit output of at most this many lines unfiltered. 0 (the default) keeps
+    /// every size filtered; a useful opt-in value is 5.
+    #[serde(default)]
+    pub short_line_threshold: usize,
+    /// Emit output of at most this many bytes unfiltered. 0 (the default) keeps
+    /// every size filtered; a useful opt-in value is 500.
+    #[serde(default)]
+    pub short_byte_threshold: usize,
 }
 
 impl Default for LimitsConfig {
@@ -237,6 +245,8 @@ impl Default for LimitsConfig {
             status_max_files: 15,
             status_max_untracked: 10,
             passthrough_max_chars: 2000,
+            short_line_threshold: 0,
+            short_byte_threshold: 0,
         }
     }
 }
@@ -964,5 +974,34 @@ enabled = false
             reparsed.retriever.tee_directory,
             Some(PathBuf::from("/custom/tee"))
         );
+    }
+
+    #[test]
+    fn test_short_thresholds_default_off() {
+        let limits = LimitsConfig::default();
+        assert_eq!(limits.short_line_threshold, 0);
+        assert_eq!(limits.short_byte_threshold, 0);
+    }
+
+    const EXISTING_LIMITS: &str = "[limits]\ngrep_max_results = 42\ngrep_max_per_file = 25\n\
+         status_max_files = 15\nstatus_max_untracked = 10\npassthrough_max_chars = 2000\n";
+
+    #[test]
+    fn test_short_thresholds_are_configurable() {
+        let toml =
+            format!("{EXISTING_LIMITS}short_line_threshold = 10\nshort_byte_threshold = 1000\n");
+        let config = Config::from_toml(&toml).expect("valid toml");
+        assert_eq!(config.limits.short_line_threshold, 10);
+        assert_eq!(config.limits.short_byte_threshold, 1000);
+    }
+
+    // A config file written before these keys existed still parses, and keeps
+    // the values it does set rather than being rejected for the two new ones.
+    #[test]
+    fn test_short_thresholds_absent_from_existing_config() {
+        let config = Config::from_toml(EXISTING_LIMITS).expect("valid toml");
+        assert_eq!(config.limits.grep_max_results, 42);
+        assert_eq!(config.limits.short_line_threshold, 0);
+        assert_eq!(config.limits.short_byte_threshold, 0);
     }
 }

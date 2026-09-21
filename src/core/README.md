@@ -94,7 +94,14 @@ grep_max_per_file = 25
 status_max_files = 15
 status_max_untracked = 10
 passthrough_max_chars = 2000
+short_line_threshold = 5    # opt-in: emit output this short unfiltered (0 = off, the default)
+short_byte_threshold = 500  # opt-in: both limits must hold (0 = off, the default)
 ```
+
+Setting both `short_*_threshold` keys makes rtk print output that small exactly
+as the command wrote it. Off by default: short output is not the same as output
+not worth filtering — a `gh pr checks` table or a JSON lint report fits in five
+lines and is precisely where the filter earns its place.
 
 ## Shared Utilities (utils.rs)
 

@@ -92,6 +92,50 @@ pub enum RunMode<'a> {
     Passthrough,
 }
 
+/// Whether output this small should reach the caller exactly as the command
+/// wrote it, with no filter in between.
+///
+/// Off unless `limits.short_line_threshold` and `limits.short_byte_threshold`
+/// are both set. It is opt-in because "short" is not the same thing as "not
+/// worth filtering": a four-row `gh pr checks` table, a one-line
+/// `golangci-lint --out-format json` report and a `git checkout` confirmation
+/// all fit in five lines and 500 bytes, and each has a filter that earns its
+/// place there (`tests/gh_pr_checks_failure_test.rs`,
+/// `tests/stderr_only_failure_test.rs`, `tests/guard_integration_test.rs` pin
+/// exactly that). What rtk-ai/rtk#2673 is really after is the canonical marker
+/// an agent greps for — `git push`'s `To <remote>` line — which is a property
+/// of the command, not of the output's length; rtk-ai/rtk#2121 tracks reading
+/// it per command. Until then this is the blunt escape hatch for anyone hitting
+/// rtk-ai/rtk#2280.
+///
+/// `guard::never_worse` covers the other half of rtk-ai/rtk#2673 already: where
+/// filtering would cost more tokens than the raw output, raw is what gets
+/// emitted.
+///
+/// Both limits must hold when set: a couple of very long lines still get
+/// filtered, and so does a page of short ones.
+///
+/// Reads the process-wide cached config, not `config::limits()` — that is a
+/// fresh `Config::load()` (disk read plus TOML parse) and this runs once per
+/// filtered command.
+fn should_auto_passthrough(text: &str) -> bool {
+    let limits = &crate::core::config::cached_config().limits;
+    short_enough_to_pass_through(
+        text,
+        limits.short_line_threshold,
+        limits.short_byte_threshold,
+    )
+}
+
+/// The decision itself, separated from where the thresholds come from so it is
+/// testable without a config file on disk.
+fn short_enough_to_pass_through(text: &str, max_lines: usize, max_bytes: usize) -> bool {
+    if max_lines == 0 || max_bytes == 0 {
+        return false;
+    }
+    text.len() <= max_bytes && text.lines().count() <= max_lines
+}
+
 fn run_captured_filter<F>(
     mut cmd: Command,
     tool_name: &str,
@@ -120,6 +164,20 @@ where
             print!("{}", result.raw_stdout);
         }
         if !result.raw_stderr.trim().is_empty() {
+            eprint!("{}", result.raw_stderr);
+        }
+        timer.track(cmd_label, &format!("rtk {}", cmd_label), raw, raw);
+        return Ok(exit_code);
+    }
+
+    if should_auto_passthrough(raw) {
+        // Same split as the failure path above: `raw` is the interleaved
+        // capture, so printing it whole would move the command's stderr onto
+        // stdout.
+        if !result.raw_stdout.is_empty() {
+            print!("{}", result.raw_stdout);
+        }
+        if !result.raw_stderr.is_empty() {
             eprint!("{}", result.raw_stderr);
         }
         timer.track(cmd_label, &format!("rtk {}", cmd_label), raw, raw);
@@ -1480,5 +1538,50 @@ mod err_test_runner_tests {
         assert!(!is_bun_count_line("6 passing"));
         assert!(!is_bun_count_line("x fail"));
         assert!(!is_bun_count_line("10 expect() calls"));
+    }
+
+    // rtk-ai/rtk#2673: short output goes out as the command wrote it.
+    const SHORT_LINES: usize = 5;
+    const SHORT_BYTES: usize = 500;
+
+    fn passes(text: &str) -> bool {
+        short_enough_to_pass_through(text, SHORT_LINES, SHORT_BYTES)
+    }
+
+    #[test]
+    fn test_short_output_passes_through() {
+        assert!(passes(""));
+        assert!(passes(
+            "To github.com:me/repo.git\n   abc1234..def5678  main -> main\n"
+        ));
+    }
+
+    #[test]
+    fn test_both_limits_must_hold() {
+        // Under the line limit, over the byte limit: two very long lines are
+        // not "already minimal".
+        let wide = format!("{}\n{}\n", "x".repeat(300), "y".repeat(300));
+        assert_eq!(wide.lines().count(), 2);
+        assert!(!passes(&wide));
+
+        // Under the byte limit, over the line limit.
+        let tall = "a\n".repeat(SHORT_LINES + 1);
+        assert!(tall.len() < SHORT_BYTES);
+        assert!(!passes(&tall));
+    }
+
+    #[test]
+    fn test_limits_are_inclusive_bounds() {
+        assert!(passes(&"a\n".repeat(SHORT_LINES)));
+        assert!(!passes(&"a\n".repeat(SHORT_LINES + 1)));
+        assert!(passes(&"a".repeat(SHORT_BYTES)));
+        assert!(!passes(&"a".repeat(SHORT_BYTES + 1)));
+    }
+
+    #[test]
+    fn test_zero_threshold_disables_passthrough() {
+        assert!(!short_enough_to_pass_through("ok\n", 0, SHORT_BYTES));
+        assert!(!short_enough_to_pass_through("ok\n", SHORT_LINES, 0));
+        assert!(!short_enough_to_pass_through("", 0, 0));
     }
 }
