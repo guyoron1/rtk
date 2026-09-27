@@ -277,6 +277,19 @@ fn filter_python_minimal(content: &str) -> String {
     result.trim().to_string()
 }
 
+/// Collect a run of code found between block comments, dropping it when it is
+/// only whitespace. The segment that opens the line keeps its indentation.
+fn push_code_segment<'a>(kept: &mut Vec<&'a str>, segment: &'a str, at_line_start: bool) {
+    let segment = if at_line_start {
+        segment.trim_end()
+    } else {
+        segment.trim()
+    };
+    if !segment.trim().is_empty() {
+        kept.push(segment);
+    }
+}
+
 impl FilterStrategy for MinimalFilter {
     fn filter(&self, content: &str, lang: &Language) -> String {
         if *lang == Language::Python {
@@ -294,16 +307,53 @@ impl FilterStrategy for MinimalFilter {
             // Handle block comments
             if let (Some(start), Some(end)) = (patterns.block_start, patterns.block_end) {
                 // starts_with, not contains: `/*` inside a string literal or
-                // glob (e.g. "src/*.rs") must not open a comment block (#2385)
-                if !in_docstring
+                // glob (e.g. "src/*.rs") must not open a comment block (#2385).
+                // This only decides whether a *fresh* comment opens on this
+                // line; once in_block_comment is true (carried from a real
+                // opener on an earlier line) the string/glob ambiguity does
+                // not apply, so the walk below can freely look for `start`
+                // again to strip further comments on the same line.
+                let opens_here = !in_docstring
                     && trimmed.starts_with(start)
-                    && !trimmed.starts_with(patterns.doc_block_start.unwrap_or("###"))
-                {
-                    in_block_comment = true;
-                }
-                if in_block_comment {
-                    if trimmed.contains(end) {
-                        in_block_comment = false;
+                    && !trimmed.starts_with(patterns.doc_block_start.unwrap_or("###"));
+                if in_block_comment || opens_here {
+                    // Walk the whole line so code after a closing `*/` (or
+                    // between several comments) is kept instead of the whole
+                    // line being dropped. An unterminated `start` leaves
+                    // in_block_comment set for the next line, as before.
+                    let mut rest = line;
+                    let mut kept: Vec<&str> = Vec::new();
+                    // Only the first segment keeps the line's indentation.
+                    let mut at_line_start = !in_block_comment;
+                    loop {
+                        if in_block_comment {
+                            match rest.find(end) {
+                                Some(i) => {
+                                    in_block_comment = false;
+                                    rest = &rest[i + end.len()..];
+                                }
+                                None => {
+                                    rest = "";
+                                    break;
+                                }
+                            }
+                        } else {
+                            match rest.find(start) {
+                                Some(i) => {
+                                    let (code, tail) = rest.split_at(i);
+                                    push_code_segment(&mut kept, code, at_line_start);
+                                    at_line_start = false;
+                                    in_block_comment = true;
+                                    rest = &tail[start.len()..];
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                    push_code_segment(&mut kept, rest, at_line_start);
+                    if !kept.is_empty() {
+                        result.push_str(&kept.join(" "));
+                        result.push('\n');
                     }
                     continue;
                 }
@@ -923,5 +973,78 @@ fn main() {
         let input = "a\nb\nc";
         let output = smart_truncate(input, 3, &Language::Unknown);
         assert_eq!(output, input);
+    }
+
+    // --- block comment closer followed by code (#2714) ---
+
+    #[test]
+    fn test_multiline_block_comment_closing_preserves_code_after() {
+        let filter = MinimalFilter;
+        let input = "/* multi-line\n   comment */ int z = 3;\nint w = 4;\n";
+        let output = filter.filter(input, &Language::C);
+        assert!(
+            output.contains("int z = 3;"),
+            "code after closing */ must be kept, got: {output}"
+        );
+        assert!(
+            output.contains("int w = 4;"),
+            "subsequent code must be kept"
+        );
+    }
+
+    #[test]
+    fn test_full_line_block_comment_still_stripped() {
+        let filter = MinimalFilter;
+        let input = "int a = 1;\n/* full line comment */\nint b = 2;\n";
+        let output = filter.filter(input, &Language::C);
+        assert!(output.contains("int a = 1;"));
+        assert!(output.contains("int b = 2;"));
+        assert!(!output.contains("full line comment"));
+    }
+
+    #[test]
+    fn test_block_comment_opens_and_closes_with_trailing_code_same_line() {
+        let filter = MinimalFilter;
+        let input = "/* opens */ int x = 5;\nint y = 6;\n";
+        let output = filter.filter(input, &Language::C);
+        assert!(output.contains("int x = 5;"), "got: {output}");
+        assert!(output.contains("int y = 6;"));
+        assert!(!output.contains("opens"));
+    }
+
+    #[test]
+    fn test_inline_block_marker_in_string_still_not_an_opener() {
+        // #2385: `/*` inside a string literal or glob must not open a block
+        // comment, and must not be affected by the closer-preserving walk.
+        let filter = MinimalFilter;
+        let input = "let glob = \"src/*.rs\";\nfn bar() {}\nfn baz() {}";
+        let output = filter.filter(input, &Language::Rust);
+        assert!(
+            output.contains("let glob = \"src/*.rs\";"),
+            "line with /* in string literal must be kept, got:\n{output}"
+        );
+        assert!(
+            output.contains("fn bar()") && output.contains("fn baz()"),
+            "block-comment state must not leak past a non-comment line, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_code_before_inline_block_comment_on_same_line_is_not_detected() {
+        // Known limitation, not a regression: `opens_here` requires the
+        // comment marker at the start of the trimmed line (#2385), so a
+        // comment preceded by real code on the same line is not recognized
+        // as a comment at all here and the whole line passes through as-is.
+        // Fixing this needs string-literal-aware scanning per language, not
+        // a position heuristic (see rtk-ai/rtk#2715).
+        let filter = MinimalFilter;
+        let input = "int x = 5; /* inline comment */\nint y = 10;\n";
+        let output = filter.filter(input, &Language::C);
+        assert!(output.contains("int x = 5;"), "got: {output}");
+        assert!(output.contains("int y = 10;"));
+        assert!(
+            output.contains("inline comment"),
+            "documents the current limitation: not stripped when preceded by code on the same line"
+        );
     }
 }
